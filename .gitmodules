@@ -1,0 +1,3 @@
+[submodule "libs/AnyCalib"]
+	path = libs/AnyCalib
+	url = https://github.com/javrtg/AnyCalib
