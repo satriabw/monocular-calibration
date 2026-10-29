@@ -1,5 +1,5 @@
+from functools import lru_cache
 import numpy as np
-import torch
 from PIL import Image  # the library of choice to load images
 import pandas as pd  # for reading the pixel coordinates from a CSV file
 import cv2
@@ -9,8 +9,6 @@ import argparse
 import os
 
 import sys
-sys.path.append('./libs/AnyCalib')
-from anycalib import AnyCalib
 from camera_model import CameraModel
 
 LOCATION_SCALING_FACTOR = 111318.84502145034
@@ -70,8 +68,22 @@ def convert_xyz_to_NED(origin_xyz, points_xyz):
 # This function predicts camera intrinsics using the AnyCalib library.
 # It takes an image as input and returns the focal length and principal point (cx, cy).
 # The model_id can be adjusted based on the type of images being processed.
+@lru_cache(maxsize=1)
+def load_intrinsics_model():
+    import torch
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "libs" / "AnyCalib"))
+    try:
+        from anycalib import AnyCalib
+    except ImportError as exc:
+        raise RuntimeError("Install AnyCalib; see requirements-auto.txt") from exc
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return AnyCalib(model_id="anycalib_pinhole").to(dev).eval(), dev
+
+
 def predict_camera_intrinsics(image):
-    dev = torch.device("cuda")
+    import torch
+    model, dev = load_intrinsics_model()
 
     # load input image and convert it to a (3, H, W) tensor with RGB values in [0, 1]
     image = torch.tensor(image, dtype=torch.float32, device=dev).permute(2, 0, 1) / 255
@@ -81,10 +93,10 @@ def predict_camera_intrinsics(image):
     # "anycalib_gen": trained with perspective, distorted and strongly distorted images,
     # "anycalib_dist": trained with distorted and strongly distorted images,
     # "anycalib_edit": Trained on edited (stretched and cropped) perspective images.
-    model = AnyCalib(model_id="anycalib_pinhole").to(dev)
     
     # predict according to the desired camera model. Implemented camera models are detailed further below.
-    output = model.predict(image, cam_id="simple_pinhole")
+    with torch.inference_mode():
+        output = model.predict(image, cam_id="simple_pinhole")
 
     # Estimated intrinsics for the selected camera model
     intrinsics = output["intrinsics"].to('cpu')
@@ -202,8 +214,10 @@ def get_reprojection_error(opti_params, center, image_points, model_points_F):
 def find_camera_params(focal_length, center, image_points, model_points_F):
     camera_matrix = build_camera_matrix(focal_length, center)
 
-    _, rot, trans = cv2.solvePnP(model_points_F, image_points, camera_matrix, None, flags=cv2.SOLVEPNP_ITERATIVE)
+    success, rot, trans = cv2.solvePnP(model_points_F, image_points, camera_matrix, None, flags=cv2.SOLVEPNP_ITERATIVE)
 
+    if not success:
+        raise ValueError("Camera pose estimation failed")
     imagePoints, _ = cv2.projectPoints(model_points_F, rot, trans, camera_matrix, None)
     image_points_reproj = imagePoints[:,0]
 
@@ -253,18 +267,19 @@ if __name__ == "__main__":
     argsparser = argparse.ArgumentParser(description="Camera Calibration Script")
     argsparser.add_argument("--image", type=str, required=True, help="Path to the input image")
     argsparser.add_argument("--csv", type=str, required=True, help="Path to the CSV file with pixel coordinates")
-    argsparser.add_argument("--method", type=str, required=False, default="anycalib", 
+    argsparser.add_argument("--method", type=str, required=False, default="anycalib", choices=["anycalib", "opencv", "estimate", "homography"],
                           help="Method for camera calibration (anycalib, opencv, estimate, or homography)")
     argsparser.add_argument("--satellite_mode", action="store_true", help="Enable satellite mode for calibration")
     argsparser.add_argument("--carla_mode", action="store_true", help="Use CARLA coordinate conversion instead of lat/lon")
     argsparser.add_argument("--visualize", action="store_true", help="Visualize calibration results")
     argsparser.add_argument("--output_dir", type=str, required=False, default=".", help="Directory to save output files")
+    argsparser.add_argument("--csv-crs", help="CRS of projected lambert_lat/lambert_lon (easting/northing) columns, e.g. EPSG:31370")
     argsparser.add_argument("--epsg", type=str, help="Enable projection mode")
     args = argsparser.parse_args()
 
     # Load image
     image_path = args.image
-    image = Image.open(image_path)
+    image = Image.open(image_path).convert("RGB")
     image_np = np.array(image)
 
     # Load CSV
@@ -273,8 +288,15 @@ if __name__ == "__main__":
     
     # Extract pixel and world coordinates from CSV as numpy arrays
     pixel_points = df[['x', 'y']].values
-    world_points = df[['lat', 'lon']].values
-    origin_points = np.array(df[['origin_lat', 'origin_lon']].values)
+    if args.csv_crs:
+        from pyproj import Transformer
+        to_geo = Transformer.from_crs(args.csv_crs, "EPSG:4326", always_xy=True)
+        lon, lat = to_geo.transform(df['lambert_lat'].to_numpy(float), df['lambert_lon'].to_numpy(float))
+        world_points = np.column_stack((lat, lon))
+        origin_points = np.repeat(world_points.mean(axis=0, keepdims=True), len(world_points), axis=0)
+    else:
+        world_points = df[['lat', 'lon']].values
+        origin_points = np.array(df[['origin_lat', 'origin_lon']].values)
     
     # Transform coordinates if EPSG is specified
     if args.epsg:
@@ -285,7 +307,7 @@ if __name__ == "__main__":
     
     # Ensure all points are in the correct format
     pixel_points = np.array(pixel_points, dtype=np.float32)
-    world_points = np.array(world_points, dtype=np.float32)
+    world_points = np.array(world_points, dtype=np.float64)
     
     # Convert world points to NED coordinates using the origin
     if args.carla_mode or args.epsg:
@@ -312,7 +334,7 @@ if __name__ == "__main__":
         _, camera_matrix, dist, rvecs, tvecs, image_points_reproj = find_camera_params_cv2(
             image_points=pixel_points,
             model_points_F=latlon_NED,
-            image_size=image_np.shape[:2]
+            image_size=(image_np.shape[1], image_np.shape[0])
         )
     else:  # Default or "homography"
         # For homography method, initialize basic camera matrix
@@ -325,6 +347,8 @@ if __name__ == "__main__":
     if args.method == "homography":
         # For homography, we just compute the direct 2D transformation
         H, _ = cv2.findHomography(latlon_NED[:, :2], pixel_points, method=cv2.RANSAC)
+        if H is None:
+            raise ValueError("No valid homography found")
         rot_CF_F = np.eye(3)
         trans_CF_F = np.zeros((3, 1))
         image_points_reproj = cv2.perspectiveTransform(latlon_NED[:, :2].reshape(-1, 1, 2), H).reshape(-1, 2)

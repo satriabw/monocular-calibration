@@ -1,0 +1,5 @@
+-r requirements.txt
+torch>=2.1
+torchvision>=0.16
+romatch==0.1.2
+anycalib @ git+https://github.com/javrtg/AnyCalib.git@027a8497d893f4b2596f23d6324c05e4b81064ed

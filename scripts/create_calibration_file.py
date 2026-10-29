@@ -133,6 +133,7 @@ class CameraCalibrationApp:
         canvas.get_tk_widget().bind("<Control-equal>", lambda _: self._zoom(canvas, 1.2))
         canvas.get_tk_widget().bind("<Control-minus>", lambda _: self._zoom(canvas, 0.8))
         canvas.get_tk_widget().bind("<Control-0>", lambda _: self._reset_zoom(canvas))
+        def _on_mousewheel(event):
             if event.state & 0x4:  # Check if Ctrl key is pressed (0x4 is the state flag for Ctrl)
                 if event.delta > 0:
                     self._zoom(canvas, 1.1)  # Zoom in
@@ -436,7 +437,7 @@ class CameraCalibrationApp:
             messagebox.showerror("Error", f"Failed to load data: {str(e)}")
     
     def _run_calibration(self):
-        if not self.camera_image:
+        if self.camera_image is None:
             messagebox.showerror("Error", "No camera image loaded")
             return
         

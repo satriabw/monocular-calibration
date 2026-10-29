@@ -10,7 +10,7 @@ class CameraModel:
         self.homography = homography
 
         self.use_homography = False
-        if self.homography:
+        if self.homography is not None:
             self.use_homography = True
 
         self.rvec          = cv2.Rodrigues(self.rot_matrix)[0]                       # 3x1
@@ -39,15 +39,18 @@ class CameraModel:
             pixel_coords: 2D pixel coordinates in the image plane
 
         Returns:
-            2D points on the ground plane
+            N-by-2 points on the ground plane
         """
         if self.use_homography:
             return self.project_points_homography(pixel_coord)
 
         # Build Homography using camera intrinsics and extrinsics to simplify projection
         # https://ethz.ch/content/dam/ethz/special-interest/mavt/dynamic-systems-n-control/idsc-dam/Lectures/amod/Lecture_6/20191007%20-%20ETH%20-%2005%20-%20CV%20IV%20-%20Camera%20calibration.pdf
-        # Assuming the ground plane is at Z=0 in camera coordinates
-        pixel_coord = pixel_coord.T
+        # The ground plane is Z=0 in world coordinates.
+        pixel_coord = cv2.undistortPoints(
+            np.asarray(pixel_coord, dtype=np.float64).reshape(-1, 1, 2),
+            self.camera_matrix, self.dist_coeffs, P=self.camera_matrix
+        ).reshape(-1, 2).T
         r1, r2 = self.rot_matrix[:,0:1], self.rot_matrix[:,1:2]
         tvec_reshaped = self.tvec.reshape(-1, 1)
         H = self.camera_matrix @ np.hstack((r1, r2, tvec_reshaped))
@@ -58,7 +61,7 @@ class CameraModel:
         ground_coords = Hinbv @ uv1
         ground_coords /= ground_coords[2, :] # Dividing by W
 
-        return ground_coords[:2, :]
+        return ground_coords[:2, :].T
     
     def project_point(self, point_xy):
         """
@@ -78,11 +81,13 @@ class CameraModel:
 
     def save_to_yml(self, filepath):
         wfs = cv2.FileStorage(filepath, cv2.FILE_STORAGE_WRITE)
+        if not wfs.isOpened():
+            raise OSError(f"Cannot write camera model: {filepath}")
         wfs.write("camera_matrix", self.camera_matrix)
         wfs.write("dist_coeffs", self.dist_coeffs)
         wfs.write("rot_matrix", self.rot_matrix)
         wfs.write("tvec", self.tvec)
-        if self.homography:
+        if self.homography is not None:
             wfs.write("homography", self.homography)
 
         wfs.release()
@@ -90,7 +95,9 @@ class CameraModel:
     @classmethod
     def load_from_yml(cls,filepath):
         fr = cv2.FileStorage(filepath, cv2.FILE_STORAGE_READ)
-        homography=fr.getNode("homography").mat() if fr.getNode("homography") else None
+        if not fr.isOpened():
+            raise OSError(f"Cannot read camera model: {filepath}")
+        homography=fr.getNode("homography").mat() if not fr.getNode("homography").empty() else None
         camera_matrix = fr.getNode("camera_matrix").mat()
         dist_coeffs = fr.getNode("dist_coeffs").mat()
         rot_matrix = fr.getNode("rot_matrix").mat()
