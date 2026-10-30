@@ -50,13 +50,37 @@ Install torch (cu121) **first**; `requirements-auto.txt` alone pulls a CUDA 13 b
 
 ## Code change
 
-`auto_calibrate.py` (`roma_model`): use the fused kernel only if `local_corr`
-imports; otherwise fall back to RoMa's native-torch path (same result, likely
-slower). Uncommitted.
+Initially `roma_model` used the fused kernel only if `local_corr` imported. Upstream
+(`2792188`) instead always uses RoMa's native-torch correlation; that version is
+what is on `main`. Numerical equivalence to the fused kernel is unmeasured.
 
-## Open question
+## Diagnostic run (fixed inputs)
 
-Why only 2 matches? Candidates to check: reference/camera viewpoint gap, the
-winter orthophoto vs. scene content, the 40 m crop width, RoMa confidence/sampling
-settings, and whether the native-torch correlation path behaves identically to the
-fused kernel. Not investigated yet.
+Reused the saved reference and intrinsics (README "Next GPU diagnostic run"). Same
+rejection, exit 2.
+
+| Stage | Count |
+|---|---|
+| Dense pixels (1,492,992) with confidence >= 0.2 | 157 |
+| Dense confidence median / p99 / max | 0.0025 / 0.055 / 0.31 |
+| Sampled (2000) with confidence >= 0.2 | 3 |
+| After spatial deduplication | 2 |
+
+Reading: RoMa itself finds almost no confident correspondences, so the loss is not
+in sampling or filtering (README's first interpretation branch).
+
+Likely cause, from viewing the inputs (not yet tested): the camera image is a
+street-level, strongly oblique view (horizon visible), while the reference is a
+straight-down orthophoto, a viewpoint change of roughly 70 degrees or more. Also:
+shark-teeth yield markings visible in the camera are absent from the orthophoto,
+the camera frame has timestamp / "Camera 01" overlays, and the orthophoto has
+several similar striped crossings (repeated-stripe ambiguity).
+
+## Next steps
+
+1. Warp the camera image to a rough top-down view (AnyCalib focal length plus an
+   approximate pitch) before matching; map matches back through the homography.
+2. One-variable-at-a-time checks: 20/40/80 m crops; reference rotations with
+   updated georeferencing.
+3. Mask the on-screen text (cheap, unlikely to suffice alone).
+4. Measure native-torch vs fused correlation if a working kernel becomes available.
