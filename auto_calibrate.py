@@ -42,7 +42,13 @@ def roma_model(backend='roma'):
             'XFeat', pretrained=True, top_k=4096, trust_repo=True).net
         model = tiny_roma_v1_outdoor(device=device, xfeat=xfeat).eval()
     else:
-        model = roma_outdoor(device=device, use_custom_corr=(device == 'cuda')).eval()
+        # The fused CUDA kernel is optional; the native torch path gives the same result.
+        try:
+            import local_corr  # noqa: F401
+            fused = device == 'cuda'
+        except ImportError:
+            fused = False
+        model = roma_outdoor(device=device, use_custom_corr=fused).eval()
     # Preserve the original confidence values instead of the sampler's thresholded ones.
     model.sample_mode = 'balanced'
     return model, device
