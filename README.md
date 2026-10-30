@@ -5,12 +5,16 @@ Monocular video calibration using pinhole camera model with support for various 
 
 ## Run the test on a GPU server
 
-**Current validation status:** 14 lightweight tests pass locally, including a
-synthetic image-to-image calibration test. Public Hasselt aerial-image retrieval
-and AnyCalib intrinsic inference were exercised. Full learned camera-to-aerial
-calibration has **not** been validated: local GPU-model work was stopped at the
-user's request. The AnyCalib weights and unfinished downloads were removed from
-the Mac. Do not treat the prototype as a verified Hasselt calibration yet.
+**Validation status (2026-10-30, user-reported GPU benchmark):** 14 lightweight
+tests passed. Full RoMa on an RTX 2080 Ti rejected the Hasselt pair (exit 2):
+only two matches survived the pipeline, with confidence 0.21–0.24. No camera
+model was exported. AnyCalib estimated f=1231.9 px and principal point
+(639.5, 360.4), using no distortion. This is a matching-stage failure; the exact
+cause is not yet established. Acceptance thresholds remain unchanged.
+
+The latest diagnostic changes have not yet been run on the GPU server. Local
+model downloads/inference remain disabled by workflow choice; deleted AnyCalib
+weights have not been restored.
 
 ### 1. Transfer the project from the Mac
 
@@ -45,13 +49,26 @@ nvidia-smi
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements-auto.txt
+export PIP_CONFIG_FILE=/dev/null  # bypass the server's unreachable NVIDIA PyIndex
+python -m pip install torch==2.5.1 torchvision==0.20.1 \
+  --index-url https://download.pytorch.org/whl/cu121 \
+  --extra-index-url https://pypi.org/simple
+python -m pip install -r requirements-auto.txt -c constraints-server-cu121.txt
 python -c 'import torch; assert torch.cuda.is_available(), "CUDA unavailable: fix the PyTorch/driver installation before running inference"; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))'
 ```
 
 If the CUDA check fails, install the PyTorch build appropriate for the server's
 driver using the [official PyTorch installation selector](https://pytorch.org/get-started/locally/),
 then repeat the check. Do not proceed with CPU fallback for this server test.
+On the tested server, driver 535 worked with these cu121 wheels; an unpinned
+installation pulled a CUDA 13 build that could not use the GPU. The constraints
+file prevents the requirements installation from silently replacing this stack.
+No global pip configuration is changed. Do **not** install `fused-local-corr`:
+the available wheel was ABI-incompatible and the server's nvcc 10.1 could not
+build it. The pipeline now explicitly uses RoMa's native PyTorch correlation
+on both CPU and GPU. Numerical equivalence to the fused implementation has not
+been measured here.
+
 The optional dependencies pin AnyCalib to a source revision and RoMa to a release.
 First inference needs Internet access and several GB of model downloads. Models
 are cached in `.cache/`; later runs reuse them. Camera images are processed on
@@ -63,7 +80,7 @@ the server, not uploaded to an inference service.
 python -m pytest -q
 ```
 
-Expected: **14 passed**. These tests do not download model weights or contact
+Expected with the diagnostic update: **15 passed**. These tests do not download model weights or contact
 imagery services. They test geometry, distortion handling, outlier rejection,
 reference coordinates, video consistency, bounded focal refinement, and a
 synthetic automatic-matching CLI run.
@@ -441,3 +458,47 @@ The comparison fits planar homographies and reports leave-one-out pixel errors.
 Lower error indicates better internal agreement, not proven absolute accuracy.
 The legacy homography output is a ground mapping only: its identity rotation
 and zero translation are placeholders, not a calibrated physical pose.
+
+## Next GPU diagnostic run: isolate why matching failed
+
+Use the saved reference and saved intrinsics from the failed run so imagery,
+location, focal length, and crop stay fixed. This command does not rerun AnyCalib.
+
+```bash
+python auto_calibrate.py \
+  --image data/hasselt/Background.bmp \
+  --reference results/hasselt-gpu/reference.png \
+  --georef results/hasselt-gpu/reference.json \
+  --intrinsics results/hasselt-gpu/intrinsics_0.json \
+  --matcher roma --output-dir results/hasselt-gpu-diagnostics
+python -m json.tool results/hasselt-gpu-diagnostics/quality_report.json
+```
+
+The `matching` section now records dense confidence quantiles, the number of
+pixels with confidence >=0.2, sampled confidence, and counts after bounds,
+confidence, and spatial filtering. `raw_matches_0.csv` preserves sampled matches
+before those filters. Sampling uses seed 42 and `balanced` mode; the existing
+0.2 confidence cutoff and geometric checks are unchanged.
+
+Interpretation:
+
+- Very few dense confidences >=0.2: the model itself finds little support for
+  this image pair. Prioritize viewpoint, rotation, repeated crossing stripes,
+  seasonal/temporal differences, and crop alignment.
+- Many dense confident points but few sampled: investigate sampling/density
+  balancing before changing models or imagery.
+- Many sampled confident points but few retained: inspect bounds and spatial
+  deduplication counts.
+
+Only after this fixed-input run, compare one variable at a time: 20/40/80-metre
+crops around the same point, then reference rotations with correctly updated
+georeferencing. Do not rotate only the image while retaining its old transform.
+Inspect the strongest matches for repeated-stripe ambiguity. A screenshot
+rendered at 4 cm/pixel does not imply 4 cm native aerial resolution or accuracy.
+
+Upstream documents correlation as optional and sampling as configurable:
+[RoMa repository](https://github.com/Parskatt/RoMa). Our raw-confidence `balanced`
+sampling differs from the upstream thresholded sampling; this difference must
+be measured, not assumed to explain the failure. Reusing fixed intrinsics here
+also intentionally disables focal refinement, which cannot affect the matching
+stage being diagnosed.

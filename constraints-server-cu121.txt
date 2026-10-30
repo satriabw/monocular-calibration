@@ -1,0 +1,3 @@
+# Tested server stack: RTX 2080 Ti, driver 535; install cu121 wheels first.
+torch==2.5.1
+torchvision==0.20.1

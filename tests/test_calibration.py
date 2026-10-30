@@ -183,3 +183,26 @@ def test_bounded_focal_refinement():
     assert report['status'] == 'success'
     assert abs(model.camera_matrix[0,0]-K[0,0]) < abs(guess[0,0]-K[0,0])/3
     assert 1/1.2 <= report['focal_refinement_scale'] <= 1.2
+
+
+def test_matching_diagnostics_survive_pose_rejection(tmp_path, monkeypatch):
+    import auto_calibrate
+    image = tmp_path/'image.png'
+    cv2.imwrite(str(image), np.zeros((100, 100, 3), np.uint8))
+    geo = tmp_path/'geo.json'
+    geo.write_text(json.dumps(dict(crs='EPSG:31370', origin=[0,0], pixel_to_world=[[1,0,0],[0,-1,0]])))
+    intr = tmp_path/'intr.json'
+    intr.write_text(json.dumps(dict(camera_matrix=[[100,0,50],[0,100,50],[0,0,1]])))
+    def fake_matches(camera, reference, backend, diagnostics):
+        return np.array([[10.,10.],[30.,30.],[50.,50.]]), np.array([[10.,10.],[30.,30.],[50.,50.]]), np.array([.21,.24,.1])
+    monkeypatch.setattr(auto_calibrate, 'match_images', fake_matches)
+    monkeypatch.setattr(sys, 'argv', ['auto_calibrate.py', '--image', str(image), '--reference', str(image), '--georef', str(geo), '--intrinsics', str(intr), '--output-dir', str(tmp_path/'out')])
+    assert auto_calibrate.main() == 2
+    report = json.loads((tmp_path/'out/quality_report.json').read_text())
+    diagnostic = report['frames'][0]['matching']
+    assert diagnostic['sampled_confidence']['total'] == 3
+    assert diagnostic['finite_in_bounds'] == 3
+    assert diagnostic['after_confidence_filter'] == 2
+    assert diagnostic['after_spatial_deduplication'] == 2
+    assert len(np.loadtxt(tmp_path/'out/raw_matches_0.csv', delimiter=',', skiprows=1)) == 3
+    assert not (tmp_path/'out/camera_model.yml').exists()

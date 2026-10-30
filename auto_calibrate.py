@@ -42,21 +42,36 @@ def roma_model(backend='roma'):
             'XFeat', pretrained=True, top_k=4096, trust_repo=True).net
         model = tiny_roma_v1_outdoor(device=device, xfeat=xfeat).eval()
     else:
-        model = roma_outdoor(device=device, use_custom_corr=(device == 'cuda')).eval()
+        model = roma_outdoor(device=device, use_custom_corr=False).eval()
     # Preserve the original confidence values instead of the sampler's thresholded ones.
     model.sample_mode = 'balanced'
     return model, device
 
 
-def match_images(camera, reference, backend='roma'):
+def confidence_summary(values):
+    values = np.asarray(values).reshape(-1)
+    finite = values[np.isfinite(values)]
+    return dict(total=len(values), finite=len(finite),
+                quantiles=dict(zip(['min', 'median', 'p90', 'p99', 'max'],
+                                   np.quantile(finite, [0, .5, .9, .99, 1]).tolist())) if len(finite) else {},
+                above_020=int(np.sum(finite >= .2)))
+
+
+def match_images(camera, reference, backend='roma', diagnostics=None):
     if backend in ('roma', 'tiny-roma'):
         import torch
         from PIL import Image
         model, device = roma_model(backend)
+        torch.manual_seed(42)
         with torch.inference_mode():
             options = {'device': device} if backend == 'roma' else {}
             warp, confidence = model.match(Image.fromarray(cv2.cvtColor(camera, cv2.COLOR_BGR2RGB)),
                                            Image.fromarray(cv2.cvtColor(reference, cv2.COLOR_BGR2RGB)), **options)
+            if diagnostics is not None:
+                diagnostics['dense_confidence'] = confidence_summary(confidence.detach().cpu().numpy())
+                diagnostics['correlation_backend'] = 'native_torch' if backend == 'roma' else 'tiny_roma'
+                diagnostics['seed'] = 42
+                diagnostics['sample_mode'] = model.sample_mode
             matches, confidence = model.sample(warp, confidence, num=2000)
             a, b = model.to_pixel_coordinates(matches, *camera.shape[:2], *reference.shape[:2])
         return a.cpu().numpy(), b.cpu().numpy(), confidence.cpu().numpy().reshape(-1)
@@ -231,6 +246,7 @@ def main():
         report['reference'] = metadata
         accepted = []
         for index, image in read_frames(args):
+            diagnostics = {}
             try:
                 if args.intrinsics:
                     intr = json.loads(args.intrinsics.read_text())
@@ -246,21 +262,28 @@ def main():
                     raise ValueError('Invalid intrinsics.')
                 (args.output_dir/f'intrinsics_{index}.json').write_text(json.dumps(dict(
                     camera_matrix=K.tolist(), dist_coeffs=dist.tolist(), image_size=[image.shape[1], image.shape[0]]), indent=2)+'\n')
-                a, b, confidence = match_images(image, reference, args.matcher)
+                a, b, confidence = match_images(image, reference, args.matcher, diagnostics)
+                diagnostics['sampled_confidence'] = confidence_summary(confidence)
+                np.savetxt(args.output_dir/f'raw_matches_{index}.csv', np.column_stack((a, b, confidence)),
+                           delimiter=',', header='image_x,image_y,reference_x,reference_y,confidence', comments='')
                 valid = (np.isfinite(a).all(axis=1) & np.isfinite(b).all(axis=1) & np.isfinite(confidence)
                          & (a >= 0).all(axis=1) & (b >= 0).all(axis=1)
                          & (a[:, 0] < image.shape[1]) & (a[:, 1] < image.shape[0])
                          & (b[:, 0] < reference.shape[1]) & (b[:, 1] < reference.shape[0])
-                         & (confidence >= .2))
+                         )
+                diagnostics['finite_in_bounds'] = int(valid.sum())
+                valid &= confidence >= .2
+                diagnostics['after_confidence_filter'] = int(valid.sum())
                 a, b, confidence = a[valid], b[valid], confidence[valid]
                 # Deduplicate by camera pixel, preventing dense clusters from dominating.
                 _, keep = np.unique(np.floor(a / 8).astype(int), axis=0, return_index=True)
                 a, b, confidence = a[keep], b[keep], confidence[keep]
+                diagnostics['after_spatial_deduplication'] = len(a)
                 world = reference_coordinates(b, metadata)
                 np.savetxt(args.output_dir/f'matches_{index}.csv', np.column_stack((a, b, world, confidence)),
                            delimiter=',', header='image_x,image_y,reference_x,reference_y,east,north,up,confidence', comments='')
                 model, quality, predicted, errors = solve(world, a, K, dist, image.shape, args.max_error, args.min_coverage, refine_focal=not bool(args.intrinsics))
-                quality.update(frame=index, camera_matrix=model.camera_matrix.tolist(), dist_coeffs=dist.tolist(), candidate_matches=len(a))
+                quality.update(frame=index, matching=diagnostics, camera_matrix=model.camera_matrix.tolist(), dist_coeffs=dist.tolist(), candidate_matches=len(a))
                 report['frames'].append(quality)
                 np.savetxt(args.output_dir/f'matches_{index}.csv', np.column_stack((a, b, world, confidence, errors)),
                            delimiter=',', header='image_x,image_y,reference_x,reference_y,east,north,up,confidence,error_px', comments='')
@@ -273,7 +296,7 @@ def main():
                 if quality['status'] == 'success':
                     accepted.append((model, quality))
             except (ValueError, RuntimeError, ImportError, cv2.error) as exc:
-                report['frames'].append(dict(frame=index, status='failed', reason=str(exc)))
+                report['frames'].append(dict(frame=index, status='failed', reason=str(exc), matching=diagnostics))
         if accepted:
             selection = select_consistent_model(accepted, require_multiple=bool(args.video))
             if selection is None:
